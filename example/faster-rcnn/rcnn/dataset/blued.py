@@ -42,9 +42,11 @@ class Blued(IMDB):
                         'white_socks', 'feet', 'non_leather_shoes', 'hot_pants']
 
         self.num_classes = len(self.classes)
-        self.image_set_index = self.load_image_set_index()
+        # self.image_set_index = self.load_image_set_index()
+        self._image_index = self.load_image_set_index()
         self.fixed_image_set_index = list()
-        self.num_images = len(self.image_set_index)
+        # self.num_images = len(self.image_set_index)
+        self.num_images = len(self._image_index)
         # logger.info('%s num_images %d' % (self.name, self.num_images))
         print('original num_images', self.num_images)
         self.error_flag = True
@@ -83,12 +85,19 @@ class Blued(IMDB):
         """
         def _get_list_inter(list_1,list_2):
             print('checking imageset...')
-            list_inter = list()
-            for buff1 in list_1:
-                for buff2 in list_2:
-                    if buff1 in buff2:
-                        list_inter.append(buff1)
-                        continue
+
+            # slow & stupid
+            # list_inter = list()
+            # for buff1 in list_1:
+            #     for buff2 in list_2:
+            #         if buff1 in buff2:
+            #             list_inter.append(buff1)
+            #             continue
+            
+            # elegant version
+            list_2_ = [os.path.basename(x) for x in list_2]
+            list_inter = list(set(list_1) & set(list_2_))
+
             return list_inter
 
         cache_file = os.path.join(self.cache_path, self.name + '_gt_roidb.pkl')
@@ -98,7 +107,7 @@ class Blued(IMDB):
             # logger.info('%s gt roidb loaded from %s' % (self.name, cache_file))
             print('roidb len: {}'.format(len(roidb)))
             self.num_images = len(roidb)
-            self.fixed_image_set_index = _get_list_inter(self.image_set_index, [x['image'] for x in roidb])
+            self.fixed_image_set_index = _get_list_inter(self._image_index, [x['image'] for x in roidb])
             print('fixed imageset len: {}'.format(len(self.fixed_image_set_index)))
             print('{} gt roidb loaded from {}'.format(self.name, cache_file))
             return roidb
@@ -108,7 +117,7 @@ class Blued(IMDB):
         # gt_roidb = [self.load_blued_annotation(
         #     dict_ann, index) for index in self.image_set_index]
         gt_roidb = list()
-        for index in self.image_set_index:
+        for index in self._image_index:
             temp = self.load_blued_annotation(dict_ann, index)
             if temp:  
                 gt_roidb.append(temp)
@@ -135,7 +144,10 @@ class Blued(IMDB):
         y1 = 0 if y1 < 0 else y1
         x2 = width-1 if x2 > (width-1) else x2
         y2 = height-1 if y2 > (height-1) else y2
-        return [x1,y1,x2,y2]
+        if (x1>=x2) or (y1>=y2):
+            return None 
+        else:
+            return [x1,y1,x2,y2]
 
     def load_blued_annotation(self, dict_ann, index):
         """
@@ -165,12 +177,17 @@ class Blued(IMDB):
         #         obj.find('difficult').text) == 0]
         #     objs = non_diff_objs
         num_objs = len(objs)
+        if num_objs == 0:
+            return None
 
         boxes = np.zeros((num_objs, 4), dtype=np.uint16)
         gt_classes = np.zeros((num_objs), dtype=np.int32)
         overlaps = np.zeros((num_objs, self.num_classes), dtype=np.float32)
+        seg_areas = np.zeros((num_objs), dtype=np.float32)
 
         class_to_index = dict(zip(self.classes, range(self.num_classes)))
+        dep_index = list()  # index of bounding-box to be deprecated
+
         # Load object bounding boxes into a data frame.
         for ix, obj in enumerate(objs):
             # bbox = obj.find('bndbox')
@@ -179,33 +196,52 @@ class Blued(IMDB):
             # y1 = float(bbox.find('ymin').text) - 1
             # x2 = float(bbox.find('xmax').text) - 1
             # y2 = float(bbox.find('ymax').text) - 1
-            if not obj:
-                # ???
-                continue
+            # if not obj:
+            #     # ???
+            #     continue
             x1 = float(obj[0])
             y1 = float(obj[1])
             x2 = float(obj[2])
             y2 = float(obj[3])
             # coordinates check
             if not (0<=x1<x2<=(size[1]-1) and 0<=y1<y2<=(size[0]-1)):
-                [x1,y1,x2,y2] = self._restrict_bounding_box([x1,y1,x2,y2],size)[:]
+                restricted_bbox = self._restrict_bounding_box([x1,y1,x2,y2],size)
+                if not restricted_bbox:
+                    print('input data error! restricting failed, object {} will be deprecated.'.format(obj))
+                    dep_index.append(ix)
+                    continue
+                [x1,y1,x2,y2] = restricted_bbox[:]
                 print('input data error! object: {} has been restricted to {}'.format(obj,[x1,y1,x2,y2,obj[4]]))
                 # self.error_flag = False
-                continue
+                # continue
             # assert 0 <= x1 < x2 <= size[1] and 0 <= y1 < y2 <= size[0], 'input data error! {}'.format(
             #     obj)
             cls = class_to_index[obj[4]]
             boxes[ix, :] = [x1, y1, x2, y2]
             gt_classes[ix] = cls
             overlaps[ix, cls] = 1.0
+            seg_areas[ix] = (x2 - x1 + 1) * (y2 - y1 + 1)
+
+        # delete bounding-boxes 
+        boxes = np.delete(boxes,dep_index,0)
+        gt_classes = np.delete(gt_classes,dep_index)
+        overlaps = np.delete(overlaps,dep_index,0)
+        seg_areas = np.delete(seg_areas,dep_index)
+        if 0 in boxes.shape:
+            return None 
 
 
         roi_rec.update({'boxes': boxes,
+                        'image': roi_rec['image'],
+                        'height': size[0],
+                        'width': size[1],
                         'gt_classes': gt_classes,
                         'gt_overlaps': overlaps,
                         'max_classes': overlaps.argmax(axis=1),
                         'max_overlaps': overlaps.max(axis=1),
-                        'flipped': False})
+                        'flipped': False,
+                        'seg_areas': seg_areas,
+                        'is_train': True})
         return roi_rec
 
     def evaluate_detections(self, detections, fixed_image_set):
